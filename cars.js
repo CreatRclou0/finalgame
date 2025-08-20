@@ -1,17 +1,33 @@
 import { CONFIG } from "./config.js";
 import { utils } from './utils.js';
+import { buildPath, withCumulativeLengths, getTurnType, N, E, S, W } from './intersection.js';
+import { STRAIGHT, LEFT, RIGHT } from './constants.js';
 
 export class Car {
     constructor({ id, direction, intersection, route = null, lane = 0, turnType = null }) {
         this.id = id;
         this.fromDirection = direction;
         this.intersection = intersection;
-        // Route: {from: 'north', to: 'west'}
-        this.route = route || { from: direction, to: intersection.getToDirection(direction, 'straight') };
+        
+        // Generate random destination if not provided
+        if (!route) {
+            const destinations = [N, E, S, W].filter(d => d !== direction);
+            const randomDestination = destinations[Math.floor(Math.random() * destinations.length)];
+            this.route = { from: direction, to: randomDestination };
+        } else {
+            this.route = route;
+        }
+        
         this.lane = lane; // 0 = left, 1 = right
         this.lateralPosition = 0;
-        this.turnType = turnType || this.calculateTurnType();
+        this.turnType = turnType || getTurnType(this.route.from, this.route.to);
         this.toDirection = this.route.to;
+
+        // Path following for turns
+        this.path = null;
+        this.pathProgress = 0;
+        this.pathProfile = null;
+        this.hasAssignedPath = false;
 
         // Position and movement
         const spawnPoint = intersection.spawnPoints[direction];
@@ -33,138 +49,45 @@ export class Car {
         this.isInIntersection = false;
         this.pathProgress = 0;
 
-        // Trajectory path for turns
-        this.path = null;
-
-        // Assign trajectory if not straight
-        if (this.turnType !== 'straight') {
-            this.path = intersection.getTrajectory(this.fromDirection, this.toDirection);
-            this.pathProgress = 0;
-        }
+        this.calculateTargetPosition();
     }
 
-    calculateTurnType() {
-        // Determine turn type from route
-        if (!this.route) return 'straight';
-        const from = this.route.from;
-        const to = this.route.to;
-        const dirs = ['north', 'east', 'south', 'west'];
-        const fromIdx = dirs.indexOf(from);
-        const toIdx = dirs.indexOf(to);
-        const diff = (toIdx - fromIdx + 4) % 4;
-        if (diff === 1) return 'right';
-        if (diff === 3) return 'left';
-        return 'straight';
+    beginTurnIfNeeded() {
+        if (this.hasAssignedPath) return;
+        
+        const turnType = getTurnType(this.route.from, this.route.to);
+        if (!turnType) return;
+
+        if (turnType === STRAIGHT) {
+            // For straight, we can use existing angle-based movement or assign a path
+            // Let's use a path for consistency
+            const p = buildPath(this.route.from, this.route.to, this.lane);
+            this.pathProfile = withCumulativeLengths(p);
+            this.path = p;
+            this.pathProgress = 0;
+            this.hasAssignedPath = true;
+            return;
+        }
+
+        // For LEFT/RIGHT, assign a path
+        const p = buildPath(this.route.from, this.route.to, this.lane);
+        this.pathProfile = withCumulativeLengths(p);
+        this.path = p;
+        this.pathProgress = 0;
+        this.hasAssignedPath = true;
     }
 
     prepareForTurn() {
         // Tactical lane change before intersection
-        if (this.turnType === 'left') this.lane = 0;
-        else if (this.turnType === 'right') this.lane = 1;
+        if (this.turnType === LEFT) this.lane = 0;
+        else if (this.turnType === RIGHT) this.lane = 1;
         // For straight, stay in current lane
     }
 
-    updateApproaching(dt, lightStates) {
-        this.prepareForTurn();
-        // ...existing code...
-        // ...existing code...
-    }
-
-    updateCrossing(dt) {
-        // Accelerate through intersection
-        this.speed = Math.min(this.maxSpeed * 1.2, this.speed + 40 * dt);
-        if (this.path) {
-            // Move along trajectory path
-            this.pathProgress += this.speed * dt / this.path.length;
-            if (this.pathProgress >= 1) {
-                // Finished turn
-                this.path = null;
-                this.pathProgress = 0;
-                // Snap to exit lane centerline and resume straight movement
-                const exit = this.intersection.exitPoints[this.toDirection];
-                this.x = exit.x;
-                this.y = exit.y;
-                this.angle = this.getInitialAngle();
-            } else {
-                const idx = Math.floor(this.pathProgress * (this.path.length - 1));
-                const next = this.path[idx];
-                this.x = next.x;
-                this.y = next.y;
-                // Update heading
-                if (idx < this.path.length - 1) {
-                    const nextPt = this.path[idx + 1];
-                    this.angle = utils.getAngle(this.x, this.y, nextPt.x, nextPt.y);
-                }
-            }
-        } else {
-            // Straight movement
-            this.x += Math.cos(this.angle) * this.speed * dt;
-            this.y += Math.sin(this.angle) * this.speed * dt;
-        }
-        // Check if we've exited the intersection
-        if (!this.isInIntersection && this.pathProgress > 0) {
-            this.state = 'exiting';
-        }
-        this.pathProgress += dt;
-    }
-
-    followTurnTrajectory(dt) {
-        // Use Bezier curve for left/right turns
-        const entry = this.intersection.getPathEntryPoint(this.fromDirection);
-        const exit = this.intersection.exitPoints[this.toDirection];
-        // Control points for Bezier (simple: entry, control1, control2, exit)
-        let control1, control2;
-        if (this.turnType === 'left') {
-            control1 = { x: entry.x - 60, y: entry.y + 60 };
-            control2 = { x: exit.x - 60, y: exit.y - 60 };
-        } else {
-            control1 = { x: entry.x + 60, y: entry.y - 60 };
-            control2 = { x: exit.x + 60, y: exit.y + 60 };
-        }
-        const t = Math.min(this.pathProgress / 1.2, 1); // 1.2s for full turn
-        const pt = utils.getBezierPoint(t, entry, control1, control2, exit);
-        this.x = pt.x;
-        this.y = pt.y;
-        // Update heading
-        if (t < 1) {
-            const nextT = Math.min(t + 0.05, 1);
-            const nextPt = utils.getBezierPoint(nextT, entry, control1, control2, exit);
-            this.angle = utils.getAngle(this.x, this.y, nextPt.x, nextPt.y);
-        }
-    }
-
-    // Example route assignment for spawning cars
-    // new Car({ id: 1, direction: 'north', intersection, route: {from: 'north', to: 'west'}, lane: 0, turnType: 'left' })
-    // new Car({ id: 2, direction: 'south', intersection, route: {from: 'south', to: 'east'}, lane: 1, turnType: 'right' })
-    // new Car({ id: 3, direction: 'east', intersection, route: {from: 'east', to: 'west'}, lane: 0, turnType: 'straight' })
-
-    getInitialAngle() {
-        switch (this.fromDirection) {
-            case CONFIG.DIRECTIONS.NORTH: return Math.PI / 2; // Facing south (down)
-            case CONFIG.DIRECTIONS.EAST: return Math.PI; // Facing west (left)
-            case CONFIG.DIRECTIONS.SOUTH: return -Math.PI / 2; // Facing north (up)
-            case CONFIG.DIRECTIONS.WEST: return 0; // Facing east (right)
-            default: return 0;
-        }
-    }
-calculateTargetPosition() {
-    // Make sure intersection and fromDirection are valid
-    if (this.intersection && typeof this.intersection.getExitPoint === 'function' && this.fromDirection) {
-        const target = this.intersection.getExitPoint(this.fromDirection);
-        if (!target || typeof target.x !== 'number' || typeof target.y !== 'number') {
-            console.warn("Target position is undefined or invalid for car", this.id);
-            return;
-        }
-        this.targetX = target.x;
-        this.targetY = target.y;
-    } else {
-        console.warn("intersection.getExitPoint is not a function or direction is missing");
-    }
-}
-
     update(deltaTime, lightStates) {
         const dt = deltaTime / 1000; // Convert to seconds
-
+        
+        // Handle state transitions
         switch (this.state) {
             case 'approaching':
                 this.updateApproaching(dt, lightStates);
@@ -180,9 +103,52 @@ calculateTargetPosition() {
                 break;
         }
 
-        // Update position based on speed and direction (keep cars in straight lines)
-        if (this.speed > 0) {
-            // Move based on the angle the car is facing
+        // Update position based on path or angle
+        if (this.path) {
+            // --- Turning along a polyline with cumulative lengths ---
+            const prof = this.pathProfile;
+            // Advance distance along the path by speed*dt
+            const advance = this.speed * dt;
+            // Convert current pathProgress (0..1) to absolute distance s:
+            const sCurrent = prof.total * this.pathProgress;
+            let sNew = sCurrent + advance;
+
+            if (sNew >= prof.total) {
+                // Reached end of path
+                const last = prof.path[prof.path.length - 1];
+                this.x = last.x;
+                this.y = last.y;
+
+                // Snap heading to exit lane direction (compute from last segment)
+                const prev = prof.path[prof.path.length - 2] || last;
+                this.angle = Math.atan2(last.y - prev.y, last.x - prev.x);
+
+                // Clear path & resume straight driving
+                this.path = null;
+                this.pathProfile = null;
+                this.pathProgress = 0;
+                return;
+            }
+
+            // Find segment index for sNew
+            const lens = prof.lens;
+            let i = 0;
+            while (i < lens.length && lens[i] < sNew) i++;
+            const i1 = Math.min(i, lens.length - 1);
+            const i0 = Math.max(0, i1 - 1);
+
+            const s0 = lens[i0], s1 = lens[i1];
+            const segT = s1 > s0 ? (sNew - s0) / (s1 - s0) : 0;
+
+            const p0 = prof.path[i0], p1 = prof.path[i1];
+            this.x = p0.x + segT * (p1.x - p0.x);
+            this.y = p0.y + segT * (p1.y - p0.y);
+            this.angle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+
+            // Normalize back to [0..1]
+            this.pathProgress = sNew / prof.total;
+        } else {
+            // --- Existing straight-line motion ---
             this.x += Math.cos(this.angle) * this.speed * dt;
             this.y += Math.sin(this.angle) * this.speed * dt;
         }
@@ -190,8 +156,36 @@ calculateTargetPosition() {
         // Check if car is in intersection
         this.isInIntersection = this.intersection.isInIntersection(this.x, this.y);
     }
+    
+    getInitialAngle() {
+        switch (this.fromDirection) {
+            case CONFIG.DIRECTIONS.NORTH: return Math.PI / 2; // Facing south (down)
+            case CONFIG.DIRECTIONS.EAST: return Math.PI; // Facing west (left)
+            case CONFIG.DIRECTIONS.SOUTH: return -Math.PI / 2; // Facing north (up)
+            case CONFIG.DIRECTIONS.WEST: return 0; // Facing east (right)
+            default: return 0;
+        }
+    }
+
+    calculateTargetPosition() {
+        // Make sure intersection and fromDirection are valid
+        if (this.intersection && this.fromDirection) {
+            // Target is now based on the route destination
+            const target = this.intersection.exitPoints[this.toDirection];
+            if (!target || typeof target.x !== 'number' || typeof target.y !== 'number') {
+                console.warn("Target position is undefined or invalid for car", this.id);
+                return;
+            }
+            this.targetX = target.x;
+            this.targetY = target.y;
+        } else {
+            console.warn("intersection or direction is missing");
+        }
+    }
 
     updateApproaching(dt, lightStates) {
+        this.prepareForTurn();
+        
         const stopLine = this.intersection.getStopLinePosition(this.fromDirection);
         const distanceToStop = this.getDistanceToStopLine(stopLine);
         
@@ -217,6 +211,10 @@ calculateTargetPosition() {
         // Check if we've reached the intersection
         if (this.isInIntersection) {
             this.state = 'crossing';
+            // Assign path when entering intersection
+            if (!this.hasAssignedPath) {
+                this.beginTurnIfNeeded();
+            }
         }
     }
 
@@ -238,39 +236,11 @@ calculateTargetPosition() {
     updateCrossing(dt) {
         // Accelerate through intersection
         this.speed = Math.min(this.maxSpeed * 1.2, this.speed + 40 * dt);
-        if (this.path) {
-            // Move along trajectory path
-            this.pathProgress += this.speed * dt / this.path.length;
-            if (this.pathProgress >= 1) {
-                // Finished turn
-                this.path = null;
-                this.pathProgress = 0;
-                // Snap to exit lane centerline and resume straight movement
-                const exit = this.intersection.exitPoints[this.toDirection];
-                this.x = exit.x;
-                this.y = exit.y;
-                this.angle = this.getInitialAngle();
-            } else {
-                const idx = Math.floor(this.pathProgress * (this.path.length - 1));
-                const next = this.path[idx];
-                this.x = next.x;
-                this.y = next.y;
-                // Update heading
-                if (idx < this.path.length - 1) {
-                    const nextPt = this.path[idx + 1];
-                    this.angle = utils.getAngle(this.x, this.y, nextPt.x, nextPt.y);
-                }
-            }
-        } else {
-            // Straight movement
-            this.x += Math.cos(this.angle) * this.speed * dt;
-            this.y += Math.sin(this.angle) * this.speed * dt;
-        }
+        
         // Check if we've exited the intersection
-        if (!this.isInIntersection && this.pathProgress > 0) {
+        if (!this.isInIntersection) {
             this.state = 'exiting';
         }
-        this.pathProgress += dt;
     }
 
     getTargetExitAngle() {
@@ -285,8 +255,8 @@ calculateTargetPosition() {
 
     updateExiting(dt) {
         // Assign lane after turn
-        if (this.turnType === 'left') this.lane = 0;
-        else if (this.turnType === 'right') this.lane = 1;
+        if (this.turnType === LEFT) this.lane = 0;
+        else if (this.turnType === RIGHT) this.lane = 1;
         // For straight, keep lane
         this.lateralPosition = 0; // Center in lane
 
@@ -418,8 +388,6 @@ calculateTargetPosition() {
                 return Infinity;
         }
     }
-
-    // ...existing code...
 }
 
 export class CarManager {
@@ -477,6 +445,16 @@ export class CarManager {
         const directions = [CONFIG.DIRECTIONS.NORTH, CONFIG.DIRECTIONS.EAST, CONFIG.DIRECTIONS.SOUTH, CONFIG.DIRECTIONS.WEST];
         const direction = directions[Math.floor(Math.random() * directions.length)];
         
+        // Randomly choose a destination (different from origin)
+        const destinations = directions.filter(d => d !== direction);
+        const destination = destinations[Math.floor(Math.random() * destinations.length)];
+        
+        // Choose lane based on turn type
+        const turnType = getTurnType(direction, destination);
+        let lane = Math.floor(Math.random() * 2); // Default random
+        if (turnType === LEFT) lane = 0; // Left turns from left lane
+        else if (turnType === RIGHT) lane = 1; // Right turns from right lane
+        
         // Check if there's space to spawn (no car too close to spawn point)
         const spawnPoint = this.intersection.spawnPoints[direction];
         const tooClose = this.cars.some(car => {
@@ -489,6 +467,8 @@ export class CarManager {
                 id: this.nextCarId++,
                 direction: direction,
                 intersection: this.intersection,
+                route: { from: direction, to: destination },
+                lane: lane
             });
             this.cars.push(car);
         }

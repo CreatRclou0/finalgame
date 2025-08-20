@@ -90,5 +90,16 @@ export const utils = {
             x: ax * tCubed + bx * tSquared + cx * t + p0.x,
             y: ay * tCubed + by * tSquared + cy * t + p0.y
         };
+    },
+
+    // Convert direction string to angle
+    directionToAngle(direction) {
+        switch (direction) {
+            case 'north': return -Math.PI / 2;
+            case 'east': return 0;
+            case 'south': return Math.PI / 2;
+            case 'west': return Math.PI;
+            default: return 0;
+        }
     }
 };
