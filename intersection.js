@@ -1,108 +1,170 @@
-import { CONFIG } from "./config.js";
+import { CONFIG, CENTER, HALF_INTER, LANE_WIDTH, N, E, S, W, LEFT, RIGHT, STRAIGHT } from "./constants.js";
+
+const { x: CX, y: CY } = CENTER;
+const DEFAULT_STEPS = 28;
+
+// Lane offset from road centerline: lane 0 (left) = -15, lane 1 (right) = +15 (when facing the intersection)
+function laneOffset(laneIndex) {
+    return (laneIndex === 0 ? -1 : +1) * (LANE_WIDTH / 2); // -15 or +15
+}
+
+// Given approach road + laneIndex, return the (x,y) of the lane center at the intersection edge (entry)
+export function entryPoint(roadID, laneIndex) {
+    const o = laneOffset(laneIndex);
+    switch (roadID) {
+        case N: return { x: CX + o, y: CY - HALF_INTER }; // coming down (+y)
+        case S: return { x: CX - o, y: CY + HALF_INTER }; // going up (-y)
+        case E: return { x: CX + HALF_INTER, y: CY + o }; // going left (-x)
+        case W: return { x: CX - HALF_INTER, y: CY - o }; // going right (+x)
+        default: throw new Error('Bad roadID');
+    }
+}
+
+// Given exit road + laneIndex, return the (x,y) just outside the intersection (exit point to land on)
+export function exitPoint(roadID, laneIndex) {
+    const o = laneOffset(laneIndex);
+    switch (roadID) {
+        case N: return { x: CX - o, y: CY - HALF_INTER }; // up
+        case S: return { x: CX + o, y: CY + HALF_INTER }; // down
+        case E: return { x: CX + HALF_INTER, y: CY - o }; // right
+        case W: return { x: CX - HALF_INTER, y: CY + o }; // left
+        default: throw new Error('Bad roadID');
+    }
+}
+
+// Utility: build an arc path by center (cx,cy), radius R, from angle A0 to A1 inclusive.
+function buildArcPath(cx, cy, R, A0, A1, steps = DEFAULT_STEPS) {
+    const path = [];
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const a = A0 + t * (A1 - A0);
+        path.push({ x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) });
+    }
+    return path;
+}
+
+// Utility: build straight line path from P0 to P1
+function buildLinePath(x0, y0, x1, y1, steps = DEFAULT_STEPS) {
+    const path = [];
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        path.push({ x: x0 + t * (x1 - x0), y: y0 + t * (y1 - y0) });
+    }
+    return path;
+}
+
+const R_RIGHT = HALF_INTER - (LANE_WIDTH / 2); // 45
+const R_LEFT = HALF_INTER + (LANE_WIDTH / 2); // 75
+
+const NE = { cx: CX + HALF_INTER, cy: CY - HALF_INTER };
+const SE = { cx: CX + HALF_INTER, cy: CY + HALF_INTER };
+const SW = { cx: CX - HALF_INTER, cy: CY + HALF_INTER };
+const NW = { cx: CX - HALF_INTER, cy: CY - HALF_INTER };
+
+// Build a path and hard-append the exact exit lane point as the final node for snapping.
+function withExitSnap(path, roadOut, laneOut) {
+    const ep = exitPoint(roadOut, laneOut);
+    const last = path[path.length - 1];
+    const dx = ep.x - last.x, dy = ep.y - last.y;
+    // If not already very close, append a short straight segment to land exactly on the lane center
+    if (dx * dx + dy * dy > 1) {
+        const tail = buildLinePath(last.x, last.y, ep.x, ep.y, 4);
+        tail.shift(); // avoid duplicate
+        return path.concat(tail);
+    }
+    return path;
+}
+
+// Straight paths (N↔S, E↔W) for each lane (0,1)
+function straightPath(from, to, laneIndex) {
+    const a = entryPoint(from, laneIndex);
+    // For straight, exit lane index = same index, but opposite side horizontally mirrored
+    const b = exitPoint(to, laneIndex);
+    return buildLinePath(a.x, a.y, b.x, b.y);
+}
+
+// Right-turn paths (quarter-circle, radius 45)
+function rightTurnPath(from, laneIndex) {
+    switch (from) {
+        case N: {
+            const base = buildArcPath(NE.cx, NE.cy, R_RIGHT, Math.PI, 1.5 * Math.PI);
+            return withExitSnap(base, E, /* right lane by default */ 1);
+        }
+        case E: {
+            const base = buildArcPath(SE.cx, SE.cy, R_RIGHT, -0.5 * Math.PI, 0);
+            return withExitSnap(base, S, 1);
+        }
+        case S: {
+            const base = buildArcPath(SW.cx, SW.cy, R_RIGHT, 0, 0.5 * Math.PI);
+            return withExitSnap(base, W, 1);
+        }
+        case W: {
+            const base = buildArcPath(NW.cx, NW.cy, R_RIGHT, 0.5 * Math.PI, Math.PI);
+            return withExitSnap(base, N, 1);
+        }
+        default: throw new Error('Bad road for right turn');
+    }
+}
+
+// Left-turn paths (quarter-circle, radius 75)
+function leftTurnPath(from, laneIndex) {
+    switch (from) {
+        case N: {
+            const base = buildArcPath(NW.cx, NW.cy, R_LEFT, 0, -0.5 * Math.PI);
+            return withExitSnap(base, W, /* target lane default */ 0);
+        }
+        case E: {
+            const base = buildArcPath(NE.cx, NE.cy, R_LEFT, 0.5 * Math.PI, Math.PI);
+            return withExitSnap(base, N, 0);
+        }
+        case S: {
+            const base = buildArcPath(SE.cx, SE.cy, R_LEFT, -Math.PI, -0.5 * Math.PI);
+            return withExitSnap(base, E, 0);
+        }
+        case W: {
+            const base = buildArcPath(SW.cx, SW.cy, R_LEFT, Math.PI, 0.5 * Math.PI);
+            return withExitSnap(base, S, 0);
+        }
+        default: throw new Error('Bad road for left turn');
+    }
+}
+
+// Registry: get path by origin/destination
+export function getTurnType(from, to) {
+    if (from === to) return null;
+    if ((from === N && to === E) || (from === E && to === S) || (from === S && to === W) || (from === W && to === N)) return RIGHT;
+    if ((from === N && to === W) || (from === W && to === S) || (from === S && to === E) || (from === E && to === N)) return LEFT;
+    return STRAIGHT; // N<->S or E<->W
+}
+
+export function buildPath(from, to, laneIndex = 1) {
+    const t = getTurnType(from, to);
+    if (t === RIGHT) return rightTurnPath(from, laneIndex);
+    if (t === LEFT) return leftTurnPath(from, laneIndex);
+    // Straight
+    return straightPath(from, to, laneIndex);
+}
+
+export function withCumulativeLengths(path) {
+    let total = 0;
+    const lens = [0];
+    for (let i = 1; i < path.length; i++) {
+        const dx = path[i].x - path[i - 1].x;
+        const dy = path[i].y - path[i - 1].y;
+        total += Math.hypot(dx, dy);
+        lens.push(total);
+    }
+    return { path, lens, total };
+}
+
 export class Intersection {
-    getPathEntryPoint(direction) {
-        // Entry point for Bezier curve (lane center at intersection edge)
-        const halfRoad = this.roadWidth / 2;
-        const laneOffset = this.laneWidth / 2;
-        switch (direction) {
-            case CONFIG.DIRECTIONS.NORTH:
-                return { x: this.centerX - laneOffset, y: this.centerY - halfRoad };
-            case CONFIG.DIRECTIONS.EAST:
-                return { x: this.centerX + halfRoad, y: this.centerY - laneOffset };
-            case CONFIG.DIRECTIONS.SOUTH:
-                return { x: this.centerX + laneOffset, y: this.centerY + halfRoad };
-            case CONFIG.DIRECTIONS.WEST:
-                return { x: this.centerX - halfRoad, y: this.centerY + laneOffset };
-            default:
-                return { x: this.centerX, y: this.centerY };
-        }
-    }
     constructor(centerX, centerY) {
-        this.centerX = 600;
-        this.centerY = 600;
-        this.size = 120; // px
-        this.roadWidth = 60; // px
-        this.laneWidth = 30; // px
+        this.centerX = centerX;
+        this.centerY = centerY;
+        this.size = CONFIG.INTERSECTION_SIZE;
+        this.roadWidth = CONFIG.ROAD_WIDTH;
+        this.laneWidth = CONFIG.LANE_WIDTH;
         this.calculatePositions();
-
-        // Lane centerlines for each approach (2 lanes per road)
-        this.laneCenters = {
-            north: [this.centerX - this.laneWidth / 2, this.centerX + this.laneWidth / 2],
-            south: [this.centerX + this.laneWidth / 2, this.centerX - this.laneWidth / 2],
-            east:  [this.centerY - this.laneWidth / 2, this.centerY + this.laneWidth / 2],
-            west:  [this.centerY + this.laneWidth / 2, this.centerY - this.laneWidth / 2]
-        };
-
-        // Precompute all 12 trajectories (from each direction, left/straight/right)
-        this.trajectories = {};
-        const dirs = ['north', 'east', 'south', 'west'];
-        for (const from of dirs) {
-            for (const turn of ['left', 'straight', 'right']) {
-                const to = this.getToDirection(from, turn);
-                this.trajectories[`${from}_${to}`] = this.computeTrajectory(from, to, turn);
-            }
-        }
-    }
-    // Helper to get destination direction for a turn
-    getToDirection(from, turn) {
-        const dirs = ['north', 'east', 'south', 'west'];
-        const idx = dirs.indexOf(from);
-        if (turn === 'straight') return dirs[(idx + 2) % 4];
-        if (turn === 'right') return dirs[(idx + 1) % 4];
-        if (turn === 'left') return dirs[(idx + 3) % 4];
-        return from;
-    }
-
-    // Compute trajectory for a given movement
-    computeTrajectory(from, to, turn) {
-        // Entry/exit points for each direction
-        const entry = this.getPathEntryPoint(from);
-        const exit = this.exitPoints[to];
-        if (turn === 'straight') {
-            // Straight: simple line
-            return [entry, exit];
-        }
-        // For left/right, use quarter-circle arc
-        const radius = this.roadWidth; // 60 px
-        let cx, cy, startAngle, endAngle;
-        if (from === 'south' && to === 'east' && turn === 'right') {
-            // Example: South→East right turn (quarter-circle)
-            cx = this.centerX + radius;
-            cy = this.centerY + radius;
-            startAngle = Math.PI;
-            endAngle = Math.PI * 1.5;
-        } else if (from === 'north' && to === 'west' && turn === 'left') {
-            // Example: North→West left turn (quarter-circle)
-            cx = this.centerX - radius;
-            cy = this.centerY - radius;
-            startAngle = 0;
-            endAngle = Math.PI * 0.5;
-        } else {
-            // Generalize for other turns
-            // Use entry/exit and intersection center to estimate arc
-            const midAngle = Math.atan2(exit.y - this.centerY, exit.x - this.centerX);
-            cx = this.centerX;
-            cy = this.centerY;
-            startAngle = Math.atan2(entry.y - cy, entry.x - cx);
-            endAngle = Math.atan2(exit.y - cy, exit.x - cx);
-        }
-        // Generate points along arc
-        const points = [];
-        const steps = 20;
-        for (let i = 0; i <= steps; i++) {
-            const t = i / steps;
-            const angle = startAngle + (endAngle - startAngle) * t;
-            points.push({
-                x: cx + radius * Math.cos(angle),
-                y: cy + radius * Math.sin(angle)
-            });
-        }
-        return points;
-    }
-
-    // Get trajectory for a route
-    getTrajectory(from, to) {
-        return this.trajectories[`${from}_${to}`];
     }
 
     initialize() {
@@ -113,36 +175,36 @@ export class Intersection {
         const halfSize = this.size / 2;
         const halfRoad = this.roadWidth / 2;
         const laneOffset = this.laneWidth / 2;
-        
-        // Stop line positions (before intersection)
-       // Stop line positions (before intersection, always close to center)
-const stopLineOffset = halfSize + 5;
-this.stopLines = {
-    [CONFIG.DIRECTIONS.NORTH]: {
-        x1: this.centerX - halfRoad,
-        y1: this.centerY - stopLineOffset,
-        x2: this.centerX + halfRoad,
-        y2: this.centerY - stopLineOffset
-    },
-    [CONFIG.DIRECTIONS.EAST]: {
-        x1: this.centerX + stopLineOffset,
-        y1: this.centerY - halfRoad,
-        x2: this.centerX + stopLineOffset,
-        y2: this.centerY + halfRoad
-    },
-    [CONFIG.DIRECTIONS.SOUTH]: {
-        x1: this.centerX - halfRoad,
-        y1: this.centerY + stopLineOffset,
-        x2: this.centerX + halfRoad,
-        y2: this.centerY + stopLineOffset
-    },
-    [CONFIG.DIRECTIONS.WEST]: {
-        x1: this.centerX - stopLineOffset,
-        y1: this.centerY - halfRoad,
-        x2: this.centerX - stopLineOffset,
-        y2: this.centerY + halfRoad
-    }
-};
+
+        // Stop line positions (before intersection, always close to center)
+        const stopLineOffset = halfSize + 5;
+        this.stopLines = {
+            [CONFIG.DIRECTIONS.NORTH]: {
+                x1: this.centerX - halfRoad,
+                y1: this.centerY - stopLineOffset,
+                x2: this.centerX + halfRoad,
+                y2: this.centerY - stopLineOffset
+            },
+            [CONFIG.DIRECTIONS.EAST]: {
+                x1: this.centerX + stopLineOffset,
+                y1: this.centerY - halfRoad,
+                x2: this.centerX + stopLineOffset,
+                y2: this.centerY + halfRoad
+            },
+            [CONFIG.DIRECTIONS.SOUTH]: {
+                x1: this.centerX - halfRoad,
+                y1: this.centerY + stopLineOffset,
+                x2: this.centerX + halfRoad,
+                y2: this.centerY + stopLineOffset
+            },
+            [CONFIG.DIRECTIONS.WEST]: {
+                x1: this.centerX - stopLineOffset,
+                y1: this.centerY - halfRoad,
+                x2: this.centerX - stopLineOffset,
+                y2: this.centerY + halfRoad
+            }
+        };
+
         // Traffic light positions
         this.lightPositions = {
             [CONFIG.DIRECTIONS.NORTH]: {
@@ -213,9 +275,9 @@ this.stopLines = {
 
     drawRoads(ctx) {
         const halfRoad = this.roadWidth / 2;
-        
+
         ctx.fillStyle = '#444444';
-        
+
         // Vertical road (North-South)
         ctx.fillRect(
             this.centerX - halfRoad,
@@ -223,7 +285,7 @@ this.stopLines = {
             this.roadWidth,
             CONFIG.CANVAS_HEIGHT
         );
-        
+
         // Horizontal road (East-West)
         ctx.fillRect(
             0,
@@ -233,56 +295,56 @@ this.stopLines = {
         );
     }
 
-drawIntersection(ctx) {
-    const halfRoad = this.roadWidth / 2;
-    const curveRadius = halfRoad; // Makes the inward curve meet nicely
+    drawIntersection(ctx) {
+        const halfRoad = this.roadWidth / 2;
+        const curveRadius = halfRoad; // Makes the inward curve meet nicely
 
-    ctx.fillStyle = '#666666';
-    ctx.beginPath();
+        ctx.fillStyle = '#666666';
+        ctx.beginPath();
 
-    // Start top middle going clockwise
-    ctx.moveTo(this.centerX - halfRoad, this.centerY - halfRoad - curveRadius);
+        // Start top middle going clockwise
+        ctx.moveTo(this.centerX - halfRoad, this.centerY - halfRoad - curveRadius);
 
-    // Top left inward curve
-    ctx.quadraticCurveTo(
-        this.centerX - halfRoad, this.centerY - halfRoad,
-        this.centerX - halfRoad - curveRadius, this.centerY - halfRoad
-    );
+        // Top left inward curve
+        ctx.quadraticCurveTo(
+            this.centerX - halfRoad, this.centerY - halfRoad,
+            this.centerX - halfRoad - curveRadius, this.centerY - halfRoad
+        );
 
-    // Left top to left bottom
-    ctx.lineTo(this.centerX - halfRoad - curveRadius, this.centerY + halfRoad);
+        // Left top to left bottom
+        ctx.lineTo(this.centerX - halfRoad - curveRadius, this.centerY + halfRoad);
 
-    // Bottom left inward curve
-    ctx.quadraticCurveTo(
-        this.centerX - halfRoad, this.centerY + halfRoad,
-        this.centerX - halfRoad, this.centerY + halfRoad + curveRadius
-    );
+        // Bottom left inward curve
+        ctx.quadraticCurveTo(
+            this.centerX - halfRoad, this.centerY + halfRoad,
+            this.centerX - halfRoad, this.centerY + halfRoad + curveRadius
+        );
 
-    // Bottom middle to bottom right
-    ctx.lineTo(this.centerX + halfRoad, this.centerY + halfRoad + curveRadius);
+        // Bottom middle to bottom right
+        ctx.lineTo(this.centerX + halfRoad, this.centerY + halfRoad + curveRadius);
 
-    // Bottom right inward curve
-    ctx.quadraticCurveTo(
-        this.centerX + halfRoad, this.centerY + halfRoad,
-        this.centerX + halfRoad + curveRadius, this.centerY + halfRoad
-    );
+        // Bottom right inward curve
+        ctx.quadraticCurveTo(
+            this.centerX + halfRoad, this.centerY + halfRoad,
+            this.centerX + halfRoad + curveRadius, this.centerY + halfRoad
+        );
 
-    // Right bottom to right top
-    ctx.lineTo(this.centerX + halfRoad + curveRadius, this.centerY - halfRoad);
+        // Right bottom to right top
+        ctx.lineTo(this.centerX + halfRoad + curveRadius, this.centerY - halfRoad);
 
-    // Top right inward curve
-    ctx.quadraticCurveTo(
-        this.centerX + halfRoad, this.centerY - halfRoad,
-        this.centerX + halfRoad, this.centerY - halfRoad - curveRadius
-    );
+        // Top right inward curve
+        ctx.quadraticCurveTo(
+            this.centerX + halfRoad, this.centerY - halfRoad,
+            this.centerX + halfRoad, this.centerY - halfRoad - curveRadius
+        );
 
-    // Back to start
-    ctx.closePath();
-    ctx.fill();
+        // Back to start
+        ctx.closePath();
+        ctx.fill();
 
-    // Restore normal drawing mode for anything after
-    ctx.globalCompositeOperation = 'source-over';
-}
+        // Restore normal drawing mode for anything after
+        ctx.globalCompositeOperation = 'source-over';
+    }
 
     drawLaneMarkings(ctx) {
         ctx.strokeStyle = '#ffffff';
@@ -290,7 +352,7 @@ drawIntersection(ctx) {
         ctx.setLineDash([10, 10]);
 
         const halfRoad = this.roadWidth / 2;
-        
+
         // Vertical center line (North-South road)
         ctx.beginPath();
         ctx.moveTo(this.centerX, 0);
@@ -298,7 +360,7 @@ drawIntersection(ctx) {
         ctx.moveTo(this.centerX, this.centerY + halfRoad);
         ctx.lineTo(this.centerX, CONFIG.CANVAS_HEIGHT);
         ctx.stroke();
-        
+
         // Horizontal center line (East-West road)
         ctx.beginPath();
         ctx.moveTo(0, this.centerY);
@@ -313,7 +375,7 @@ drawIntersection(ctx) {
     drawStopLines(ctx) {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = 4;
-        
+
         Object.values(this.stopLines).forEach(line => {
             ctx.beginPath();
             ctx.moveTo(line.x1, line.y1);
@@ -327,34 +389,13 @@ drawIntersection(ctx) {
         return this.stopLines[direction];
     }
 
-    getSpawnPoint(direction) {
-        const offset = 300; // Adjust as needed for your canvas
-        switch (direction) {
-            case 'north': return { x: this.centerX, y: this.centerY - offset };
-            case 'south': return { x: this.centerX, y: this.centerY + offset };
-            case 'east':  return { x: this.centerX + offset, y: this.centerY };
-            case 'west':  return { x: this.centerX - offset, y: this.centerY };
-            default: return undefined;
+    getLightPosition(direction) {
+        if (!direction || typeof direction !== 'string') {
+            console.warn("Invalid direction for getLightPosition:", direction);
+            return undefined;
         }
+        return this.lightPositions[direction];
     }
-
-    getExitPoint(direction) {
-        const offset = 300; // Adjust as needed for your canvas
-        switch (direction) {
-            case 'north': return { x: this.centerX, y: this.centerY - offset };
-            case 'south': return { x: this.centerX, y: this.centerY + offset };
-            case 'east':  return { x: this.centerX + offset, y: this.centerY };
-            case 'west':  return { x: this.centerX - offset, y: this.centerY };
-            default: return undefined;
-        }
-    }
-getLightPosition(direction) {
-    if (!direction || typeof direction !== 'string') {
-        console.warn("Invalid direction for getLightPosition:", direction);
-        return undefined;
-    }
-    return this.lightPositions[direction];
-}
 
     // Check if a point is within the intersection
     isInIntersection(x, y) {
@@ -367,22 +408,11 @@ getLightPosition(direction) {
         );
     }
 
-    // Get proper exit point based on turn type to ensure correct lane usage
-    // ...existing code...
-    getProperExitPoint(fromDirection, toDirection, turnType) {
-        const laneOffset = this.laneWidth / 2;
-
-        // Improved turn logic based on your description
-        // Removed turning logic
-        return this.exitPoints[toDirection];
-    }
-
-    // Get turning path for straight-line turns (no curves)
-    // Example: get path for left, right, straight
-    // intersection.getTrajectory('north', 'west') // left
-    // intersection.getTrajectory('south', 'east') // right
-        // intersection.getTrajectory('east', 'west') // straight
     setCarManager(carManager) {
         this.carManager = carManager;
+    }
+
+    getAllCars() {
+        return this.carManager ? this.carManager.getCars() : [];
     }
 }
